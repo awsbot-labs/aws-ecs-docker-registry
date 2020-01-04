@@ -1,0 +1,879 @@
+{
+    "AWSTemplateFormatVersion": "2010-09-09",
+    "Description": "Creates the Docker Registry application.",
+    "Parameters": {
+        "BackupsBucket": {
+            "Type": "String",
+            "Description": "A backup bucket to store the Regsitry configuration"
+        },
+        "StorageBucket": {
+            "Type": "String",
+            "Description": "The backend storage for the Docker registry."
+        },
+        "KeyName": {
+            "Description": "Name of an existing EC2 KeyPair to enable SSH access to the instances",
+            "Default": "default",
+            "Type": "AWS::EC2::KeyPair::KeyName",
+            "MinLength": "1",
+            "MaxLength": "64",
+            "AllowedPattern": "[-_ a-zA-Z0-9]*",
+            "ConstraintDescription": "can contain only alphanumeric characters, spaces, dashes and underscores."
+        },
+        "ContainerPort": {
+            "Description": "The application port",
+            "Default": "5000",
+            "Type": "String"
+        },
+        "DNSDomain": {
+            "Description": "DNS Name for the Application",
+            "Type": "String"
+        },
+        "DNSName": {
+            "Description": "DNS Name for the Application",
+            "Type": "String",
+            "Default": "registry"
+        },
+        "DockerImage": {
+            "Default": "registry:2",
+            "Description": "A docker image to for the task definition.",
+            "Type": "String"
+        },
+        "RegistryHtpasswd": {
+            "Type": "String",
+            "Description": "The htpasswd for the docker registry.",
+            "NoEcho": "true"
+        },
+        "SSHLocation": {
+            "Description": " The IP address range that can be used to SSH to the EC2 instances",
+            "Default": "194.74.186.235/32",
+            "Type": "String",
+            "MinLength": "9",
+            "MaxLength": "18",
+            "AllowedPattern": "(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})",
+            "ConstraintDescription": "must be a valid IP CIDR range of the form x.x.x.x/x."
+        },
+        "SSLCertificateId": {
+            "Description": "The Id of the SSL certificate.",
+            "Type": "String"
+        },
+        "Subnets": {
+            "Description": "A comma delimited list of subnets for the elasticsearch e.g. subnet-08bf4951,subnet-30289a55,subnet-e2479c95",
+            "Type": "CommaDelimitedList"
+        },
+        "VpcId": {
+            "Type": "String"
+        }
+    },
+    "Conditions": {
+        "Is-EC2-VPC": {
+            "Fn::Or": [
+                {
+                    "Fn::Equals": [
+                        {
+                            "Ref": "AWS::Region"
+                        },
+                        "eu-central-1"
+                    ]
+                },
+                {
+                    "Fn::Equals": [
+                        {
+                            "Ref": "AWS::Region"
+                        },
+                        "cn-north-1"
+                    ]
+                }
+            ]
+        },
+        "Is-EC2-Classic": {
+            "Fn::Not": [
+                {
+                    "Condition": "Is-EC2-VPC"
+                }
+            ]
+        }
+    },
+    "Mappings": {
+        "AWSRegion2AMI": {
+            "us-east-1": {
+                "ecs": "ami-4fe4852a"
+            },
+            "us-west-2": {
+                "ecs": "ami-8bd4c7bb"
+            },
+            "eu-west-1": {
+                "ecs": "ami-7948320e"
+            },
+            "ap-northeast-1": {
+                "ecs": "ami-ce2ba4ce"
+            },
+            "ap-southeast-2": {
+                "ecs": "ami-3f531f05"
+            }
+        }
+    },
+    "Resources": {
+        "ECSServiceRole": {
+            "Type": "AWS::IAM::Role",
+            "Properties": {
+                "AssumeRolePolicyDocument": {
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": {
+                                "Service": [
+                                    "ecs.amazonaws.com"
+                                ]
+                            },
+                            "Action": [
+                                "sts:AssumeRole"
+                            ]
+                        }
+                    ]
+                },
+                "Path": "/",
+                "Policies": [
+                    {
+                        "PolicyName": "gitlab-ecs-service",
+                        "PolicyDocument": {
+                            "Statement": [
+                                {
+                                    "Effect": "Allow",
+                                    "Action": [
+                                        "elasticloadbalancing:Describe*",
+                                        "elasticloadbalancing:DeregisterInstancesFromLoadBalancer",
+                                        "elasticloadbalancing:RegisterInstancesWithLoadBalancer",
+                                        "ec2:Describe*",
+                                        "ec2:AuthorizeSecurityGroupIngress"
+                                    ],
+                                    "Resource": "*"
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        },
+        "EC2InstanceRole": {
+            "Type": "AWS::IAM::Role",
+            "Properties": {
+                "AssumeRolePolicyDocument": {
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": {
+                                "Service": [
+                                    "ec2.amazonaws.com"
+                                ]
+                            },
+                            "Action": [
+                                "sts:AssumeRole"
+                            ]
+                        }
+                    ]
+                },
+                "Path": "/",
+                "Policies": [
+                    {
+                        "PolicyName": "gitlab-ec2-instance-policy",
+                        "PolicyDocument": {
+                            "Statement": [
+                                {
+                                    "Effect": "Allow",
+                                    "Action": [
+                                        "ecs:CreateCluster",
+                                        "ecs:RegisterContainerInstance",
+                                        "ecs:DeregisterContainerInstance",
+                                        "ecs:DiscoverPollEndpoint",
+                                        "ecs:Submit*",
+                                        "ecs:Poll"
+                                    ],
+                                    "Resource": "*"
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        },
+        "IamPolicy": {
+            "Type": "AWS::IAM::Policy",
+            "DependsOn": "EC2InstanceRole",
+            "Properties": {
+                "PolicyName": "gitlab-iam-policy",
+                "PolicyDocument": {
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Action": [
+                                "ecs:CreateCluster",
+                                "ecs:DeregisterContainerInstance",
+                                "ecs:DiscoverPollEndpoint",
+                                "ecs:Poll",
+                                "ecs:RegisterContainerInstance",
+                                "ecs:Submit*"
+                            ],
+                            "Resource": "*"
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Action": [
+                                "ec2:*",
+                                "elasticloadbalancing:Describe*",
+                                "elasticloadbalancing:DeregisterInstancesFromLoadBalancer",
+                                "elasticloadbalancing:RegisterInstancesWithLoadBalancer"
+                            ],
+                            "Resource": "*"
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Action": [
+                                "S3:ListBucket"
+                            ],
+                            "Resource": {
+                                "Fn::Join": [
+                                    "",
+                                    [
+                                        "arn:aws:s3:::",
+                                        {
+                                            "Ref": "BackupsBucket"
+                                        }
+                                    ]
+                                ]
+                            }
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Action": [
+                                "s3:GetObject",
+                                "s3:PutObject"
+                            ],
+                            "Resource": {
+                                "Fn::Join": [
+                                    "",
+                                    [
+                                        "arn:aws:s3:::",
+                                        {
+                                            "Ref": "BackupsBucket"
+                                        },
+                                        "/*"
+                                    ]
+                                ]
+                            }
+                        }
+                    ]
+                },
+                "Roles": [
+                    {
+                        "Ref": "EC2InstanceRole"
+                    }
+                ]
+            }
+        },
+        "IamInstanceProfile": {
+            "Type": "AWS::IAM::InstanceProfile",
+            "DependsOn": "EC2InstanceRole",
+            "Properties": {
+                "Path": "/",
+                "Roles": [
+                    {
+                        "Ref": "EC2InstanceRole"
+                    }
+                ]
+            }
+        },
+        "LoadBalancerSecurityGroup": {
+            "Type": "AWS::EC2::SecurityGroup",
+            "Properties": {
+                "GroupDescription": "Enable HTTP access on port 80.",
+                "SecurityGroupIngress": [
+                    {
+                        "IpProtocol": "tcp",
+                        "FromPort": "80",
+                        "ToPort": "80",
+                        "CidrIp": {
+                            "Ref": "SSHLocation"
+                        }
+                    },
+                    {
+                        "IpProtocol": "tcp",
+                        "FromPort": "443",
+                        "ToPort": "443",
+                        "CidrIp": {
+                            "Ref": "SSHLocation"
+                        }
+                    }
+                ],
+                "VpcId": "vpc-d52b9eb0"
+            }
+        },
+        "AutoScalingSecurityGroup": {
+            "Type": "AWS::EC2::SecurityGroup",
+            "Properties": {
+                "GroupDescription": "Enable SSH access",
+                "SecurityGroupIngress": [
+                    {
+                        "IpProtocol": "tcp",
+                        "FromPort": {
+                            "Ref": "ContainerPort"
+                        },
+                        "ToPort": {
+                            "Ref": "ContainerPort"
+                        },
+                        "SourceSecurityGroupOwnerId": {
+                            "Fn::GetAtt": [
+                                "ElasticLoadBalancer",
+                                "SourceSecurityGroup.OwnerAlias"
+                            ]
+                        },
+                        "SourceSecurityGroupName": {
+                            "Fn::GetAtt": [
+                                "ElasticLoadBalancer",
+                                "SourceSecurityGroup.GroupName"
+                            ]
+                        }
+                    },
+                    {
+                        "IpProtocol": "tcp",
+                        "FromPort": "22",
+                        "ToPort": "22",
+                        "CidrIp": {
+                            "Ref": "SSHLocation"
+                        }
+                    },
+                    {
+                        "IpProtocol": "tcp",
+                        "FromPort": {
+                            "Ref": "ContainerPort"
+                        },
+                        "ToPort": {
+                            "Ref": "ContainerPort"
+                        },
+                        "CidrIp": {
+                            "Ref": "SSHLocation"
+                        }
+                    }
+                ]
+            }
+        },
+        "AutoScalingGroup": {
+            "Type": "AWS::AutoScaling::AutoScalingGroup",
+            "UpdatePolicy": {
+                "AutoScalingRollingUpdate": {
+                    "MaxBatchSize": "1",
+                    "MinInstancesInService": "1",
+                    "PauseTime": "PT2M30S"
+                }
+            },
+            "CreationPolicy": {
+                "ResourceSignal": {
+                    "Count": "1",
+                    "Timeout": "PT15M"
+                }
+            },
+            "Properties": {
+                "AvailabilityZones": {
+                    "Fn::GetAZs": ""
+                },
+                "LaunchConfigurationName": {
+                    "Ref": "AutoScalingLaunchConfig"
+                },
+                "LoadBalancerNames": [
+                    {
+                        "Ref": "ElasticLoadBalancer"
+                    }
+                ],
+                "MinSize": "1",
+                "MaxSize": "3",
+                "DesiredCapacity": "1",
+                "Tags": [
+                    {
+                        "Key": "Name",
+                        "Value": {
+                            "Fn::Join": [
+                                "",
+                                [
+                                    {
+                                        "Ref": "DNSName"
+                                    },
+                                    ".",
+                                    {
+                                        "Ref": "DNSDomain"
+                                    }
+                                ]
+                            ]
+                        },
+                        "PropagateAtLaunch": "true"
+                    }
+                ]
+            }
+        },
+        "AutoScalingLaunchConfig": {
+            "DependsOn": "ECSCluster",
+            "Type": "AWS::AutoScaling::LaunchConfiguration",
+            "Metadata": {
+                "AWS::CloudFormation::Init": {
+                    "configSets": {
+                        "full_install": [
+                            "install_cfn",
+                            "configure_ecs",
+                            "registry"
+                        ]
+                    },
+                    "install_cfn": {
+                        "files": {
+                            "/etc/cfn/cfn-hup.conf": {
+                                "content": {
+                                    "Fn::Join": [
+                                        "",
+                                        [
+                                            "[main]\n",
+                                            "interval=1\n",
+                                            "stack=",
+                                            {
+                                                "Ref": "AWS::StackId"
+                                            },
+                                            "\n",
+                                            "region=",
+                                            {
+                                                "Ref": "AWS::Region"
+                                            },
+                                            "\n"
+                                        ]
+                                    ]
+                                },
+                                "mode": "000400",
+                                "owner": "root",
+                                "group": "root"
+                            },
+                            "/etc/cfn/hooks.d/cfn-auto-reloader.conf": {
+                                "content": {
+                                    "Fn::Join": [
+                                        "",
+                                        [
+                                            "[cfn-auto-reloader-hook]\n",
+                                            "triggers=post.update\n",
+                                            "path=Resources.AutoScalingLaunchConfig.Metadata.AWS::CloudFormation::Init\n",
+                                            "action=/opt/aws/bin/cfn-init -v ",
+                                            "         --stack ",
+                                            {
+                                                "Ref": "AWS::StackName"
+                                            },
+                                            "         --resource AutoScalingLaunchConfig ",
+                                            "         --configsets full_install ",
+                                            "         --region ",
+                                            {
+                                                "Ref": "AWS::Region"
+                                            },
+                                            "\n",
+                                            "runas=root\n"
+                                        ]
+                                    ]
+                                }
+                            }
+                        },
+                        "services": {
+                            "sysvinit": {
+                                "cfn-hup": {
+                                    "enabled": "true",
+                                    "ensureRunning": "true",
+                                    "files": [
+                                        "/etc/cfn/cfn-hup.conf",
+                                        "/etc/cfn/hooks.d/cfn-auto-reloader.conf"
+                                    ]
+                                }
+                            }
+                        }
+                    },
+                    "configure_ecs": {
+                        "files": {
+                            "/etc/ecs/ecs.config": {
+                                "content": {
+                                    "Fn::Join": [
+                                        "",
+                                        [
+                                            "ECS_CLUSTER=",
+                                            {
+                                                "Ref": "ECSCluster"
+                                            },
+                                            "\n"
+                                        ]
+                                    ]
+                                },
+                                "mode": "000644",
+                                "owner": "root",
+                                "group": "root"
+                            }
+                        }
+                    },
+                    "registry": {
+                        "files": {
+                            "/etc/docker/registry/htpasswd": {
+                                "content": {
+                                    "Fn::Join": [
+                                        "",
+                                        [
+                                            {
+                                                "Ref": "RegistryHtpasswd"
+                                            }
+                                        ]
+                                    ]
+                                },
+                                "mode": "000644",
+                                "owner": "root",
+                                "group": "root"
+                            },
+                            "/etc/docker/registry/config.yml": {
+                                "content": {
+                                    "Fn::Join": [
+                                        "",
+                                        [
+                                            "version: 0.1\n",
+                                            "log:\n",
+                                            "  fields:\n",
+                                            "    service: registry\n",
+                                            "http:\n",
+                                            "    addr: :5000\n",
+                                            "    tls:\n",
+                                            "      certificate: /etc/docker/registry/DigitalWildCard.crt\n",
+                                            "      key: /etc/docker/registry/key\n",
+                                            "auth:\n",
+                                            "  htpasswd:\n",
+                                            "    realm: basic-realm\n",
+                                            "    path: /etc/docker/registry/htpasswd\n",
+                                            "storage:\n",
+                                            "  s3:\n",
+                                            "    accesskey: ",
+                                            {
+                                                "Ref": "Keys"
+                                            },
+                                            "\n",
+                                            "    secretkey: ",
+                                            {
+                                                "Fn::GetAtt": [
+                                                    "Keys",
+                                                    "SecretAccessKey"
+                                                ]
+                                            },
+                                            "\n",
+                                            "    region: ",
+                                            {
+                                                "Ref": "AWS::Region"
+                                            },
+                                            "\n",
+                                            "    bucket: ",
+                                            {
+                                                "Ref": "StorageBucket"
+                                            },
+                                            "\n",
+                                            "    encrypt: true\n",
+                                            "    secure: true\n",
+                                            "    v4auth: true\n",
+                                            "    chunksize: 5242880\n",
+                                            "redis:\n",
+                                            "  addr: redis:6379\n",
+                                            "\n"
+                                        ]
+                                    ]
+                                },
+                                "mode": "000644",
+                                "owner": "root",
+                                "group": "root"
+                            }
+                        },
+                        "commands": {
+                            "tls_key": {
+                                "command" : "/usr/bin/aws s3 cp s3://BUCKET_NAME/registry/key /etc/docker/registry --include '*' --region eu-west-1",
+                                "cwd" : "/etc/docker/registry",
+                                "test" : "test ! -e /etc/docker/registry/key",
+                                "ignoreErrors" : "false"
+                            },
+                            "tls_bundle": {
+                                "command" : "/usr/bin/aws s3 cp s3://BUCKET_NAME/registry/DigitalWildCard.crt /etc/docker/registry --include '*' --region eu-west-1",
+                                "cwd" : "/etc/docker/registry",
+                                "test" : "test ! -e /etc/docker/registry/DigitalWildCard.crt",
+                                "ignoreErrors" : "false"
+                            }
+                        }
+                    }
+                }
+            },
+            "Properties": {
+                "BlockDeviceMappings": [
+                    {
+                        "DeviceName": "/dev/xvdb",
+                        "Ebs": {
+                            "DeleteOnTermination": "false",
+                            "VolumeSize": "200"
+                        }
+                    }
+                ],
+                "ImageId": {
+                    "Fn::FindInMap": [
+                        "AWSRegion2AMI",
+                        {
+                            "Ref": "AWS::Region"
+                        },
+                        "ecs"
+                    ]
+                },
+                "InstanceType": "t2.medium",
+                "IamInstanceProfile": {
+                    "Ref": "IamInstanceProfile"
+                },
+                "SecurityGroups": [
+                    {
+                        "Ref": "AutoScalingSecurityGroup"
+                    }
+                ],
+                "KeyName": {
+                    "Ref": "KeyName"
+                },
+                "UserData": {
+                    "Fn::Base64": {
+                        "Fn::Join": [
+                            "",
+                            [
+                                "#!/bin/bash -xe\n",
+                                "mkfs -t ext4 /dev/xvdb && echo \"/dev/xvdb /srv ext4 defaults 0 0\" >> /etc/fstab && mount -a\n",
+                                "yum install -y aws-cfn-bootstrap aws-cli vim wget\n",
+                                "/opt/aws/bin/cfn-init -v",
+                                " --stack ",
+                                {
+                                    "Ref": "AWS::StackId"
+                                },
+                                " --resource AutoScalingLaunchConfig",
+                                " --configsets full_install",
+                                " --region ",
+                                {
+                                    "Ref": "AWS::Region"
+                                },
+                                " && ",
+                                "/usr/bin/aws s3 sync s3://",
+                                {
+                                    "Ref": "BackupsBucket"
+                                },
+                                " /srv/registry --include '*' --region ",
+                                {
+                                    "Ref": "AWS::Region"
+                                },
+                                " && ",
+                                "/opt/aws/bin/cfn-signal -e $?",
+                                " --stack ",
+                                {
+                                    "Ref": "AWS::StackId"
+                                },
+                                " --resource AutoScalingGroup ",
+                                " --region ",
+                                {
+                                    "Ref": "AWS::Region"
+                                },
+                                "\n"
+                            ]
+                        ]
+                    }
+                }
+            }
+        },
+        "ElasticLoadBalancer": {
+            "Type": "AWS::ElasticLoadBalancing::LoadBalancer",
+            "Properties": {
+                "HealthCheck": {
+                    "HealthyThreshold": "2",
+                    "Interval": "6",
+                    "Target": "TCP:5000",
+                    "Timeout": "3",
+                    "UnhealthyThreshold": "3"
+                },
+                "CrossZone": "true",
+                "Listeners": [
+                    {
+                        "InstancePort": {
+                            "Ref": "ContainerPort"
+                        },
+                        "InstanceProtocol": "HTTP",
+                        "LoadBalancerPort": "443",
+                        "Protocol": "HTTPS",
+                        "SSLCertificateId": {
+                            "Ref": "SSLCertificateId"
+                        }
+                    }
+                ],
+                "SecurityGroups": [
+                    {
+                        "Ref": "LoadBalancerSecurityGroup"
+                    }
+                ],
+                "Subnets": {
+                    "Ref": "Subnets"
+                }
+            }
+        },
+        "ECSCluster": {
+            "Type": "AWS::ECS::Cluster"
+        },
+        "ECSTaskDefinition": {
+            "Type": "AWS::ECS::TaskDefinition",
+            "Properties": {
+                "ContainerDefinitions": [
+                    {
+                        "Name": {
+                            "Ref": "DNSName"
+                        },
+                        "Image": {
+                            "Ref": "DockerImage"
+                        },
+                        "Essential": "true",
+                        "Cpu": "1024",
+                        "Memory": "2048",
+                        "Links": [ "redis" ],
+                        "PortMappings": [
+                            {
+                                "ContainerPort": {
+                                    "Ref": "ContainerPort"
+                                },
+                                "HostPort": {
+                                    "Ref": "ContainerPort"
+                                }
+                            }
+                        ],
+                        "MountPoints": [
+                            {
+                                "ContainerPath": "/etc/docker/registry/config.yml",
+                                "SourceVolume": "docker-config"
+                            },
+                            {
+                                "ContainerPath": "/etc/docker/registry/htpasswd",
+                                "SourceVolume": "docker-htpasswd"
+                            }
+                        ]
+                    },
+                    {
+                        "Name": "redis",
+                        "Image": "redis",
+                        "Essential": "true",
+                        "Cpu": "512",
+                        "Memory": "512"
+                    }
+                ],
+                "Volumes": [
+                    {
+                        "Name": "docker-config",
+                        "Host": {
+                            "SourcePath": "/etc/docker/registry/config.yml"
+                        }
+                    },
+                    {
+                        "Name": "docker-htpasswd",
+                        "Host": {
+                            "SourcePath": "/etc/docker/registry/htpasswd"
+                        }
+                    }
+                ]
+            }
+        },
+        "ECSServiceDefinition": {
+            "DependsOn": "AutoScalingGroup",
+            "Type": "AWS::ECS::Service",
+            "Properties": {
+                "Cluster": {
+                    "Ref": "ECSCluster"
+                },
+                "DesiredCount": "1",
+                "LoadBalancers": [
+                    {
+                        "ContainerName": {
+                            "Ref": "DNSName"
+                        },
+                        "ContainerPort": {
+                            "Ref": "ContainerPort"
+                        },
+                        "LoadBalancerName": {
+                            "Ref": "ElasticLoadBalancer"
+                        }
+                    }
+                ],
+                "Role": {
+                    "Ref": "ECSServiceRole"
+                },
+                "TaskDefinition": {
+                    "Ref": "ECSTaskDefinition"
+                }
+            }
+        },
+        "RecordSetGroup": {
+            "Type": "AWS::Route53::RecordSetGroup",
+            "Properties": {
+                "HostedZoneName": {
+                    "Fn::Join": [
+                        "",
+                        [
+                            {
+                                "Ref": "DNSDomain"
+                            },
+                            "."
+                        ]
+                    ]
+                },
+                "Comment": "DNS Records",
+                "RecordSets": [
+                    {
+                        "Name": {
+                            "Fn::Join": [
+                                "",
+                                [
+                                    {
+                                        "Ref": "DNSName"
+                                    },
+                                    ".",
+                                    {
+                                        "Ref": "DNSDomain"
+                                    },
+                                    "."
+                                ]
+                            ]
+                        },
+                        "Type": "A",
+                        "AliasTarget": {
+                            "DNSName": {
+                                "Fn::GetAtt": [
+                                    "ElasticLoadBalancer",
+                                    "DNSName"
+                                ]
+                            },
+                            "EvaluateTargetHealth": "true",
+                            "HostedZoneId": {
+                                "Fn::GetAtt": [
+                                    "ElasticLoadBalancer",
+                                    "CanonicalHostedZoneNameID"
+                                ]
+                            }
+                        }
+                    }
+                ]
+            }
+        },
+        "User": {
+            "Type": "AWS::IAM::User"
+        },
+        "Keys": {
+            "Type": "AWS::IAM::AccessKey",
+            "Properties": {
+                "UserName": {
+                    "Ref": "User"
+                }
+            }
+        }
+    },
+    "Outputs": {
+        "LoadbalancerEndpoint": {
+            "Description": "The DNSName of the load balancer",
+            "Value": {
+                "Fn::GetAtt": [
+                    "ElasticLoadBalancer",
+                    "DNSName"
+                ]
+            }
+        }
+    }
+}

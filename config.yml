@@ -1,0 +1,30 @@
+version: 0.1
+log:
+  fields:
+    service: registry
+storage:
+    cache:
+        blobdescriptor: inmemory
+http:
+    addr: :5000
+    headers:
+        X-Content-Type-Options: [nosniff]
+health:
+  storagedriver:
+    enabled: true
+    interval: 10s
+    threshold: 3
+storage:
+  s3:
+    accesskey: 
+    secretkey: 
+    region: eu-west-1
+    bucket: registry.service.opg.digital
+    encrypt: true
+    secure: true
+    v4auth: true
+    chunksize: 5242880
+auth:
+  htpasswd:
+    realm: basic-realm
+    path: /etc/docker/registry/htpasswd
